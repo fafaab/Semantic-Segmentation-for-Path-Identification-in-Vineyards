@@ -1,0 +1,25 @@
+<launch>
+
+    <node name="ros_unet_segmentation" pkg="ros_unet_segmentation" type="unet_ros_inference" output="screen" >
+        
+        <!-- Input -->
+        <!-- Color image_raw topic to="/topic/name" -->
+        <remap from="/camera/color/image_raw"             to="/camera/color/image_raw"/>
+        <!-- Output -->
+        <!-- Rename output topic if required -->
+        <remap from="segmentation/color/image_raw"        to="/segmentation/color/image_raw" />
+
+        <!--topic for subscriber for outdoor-->
+        <param name="topic_subscriber" value="/camera/color/image_raw" />
+        
+        <!--topic for subscriber for outdoor-->
+        <!--param name="topic_subscriber" value="/d400/color/image_raw" /-->
+        <!-- GPU ID -->
+        <param name="device" value="cuda:0" />
+        <!-- Path to configuration file. Change path according to encoder-decoder -->
+        <param name="cfg_file_path" value="$(find ros_unet_segmentation)/config/unet_config.yaml" />
+        <!-- Path to model ckpt dir. -->
+        <param name="model_ckpt_path" value="$(find ros_unet_segmentation)/ckpt/Unet_Mobilenet_Outdoor.pt" />
+    </node>   
+
+</launch>
