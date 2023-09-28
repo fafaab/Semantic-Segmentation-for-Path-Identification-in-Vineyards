@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+# System libs
+import os
+import sys
+from distutils.version import LooseVersion
+# Numerical libs
+import torch
+from torchvision import transforms as T
+import argparse 
+from torch.distributed import get_rank
+import cv2
+import numpy as np
+import time
+import timeit
+from config import load_cfg_from_cfg_file
+from unet_inference import UNETInference 
+# ROS libs
+import rospy
+from sensor_msgs.msg import Image, CompressedImage
+#from PIL import Image as PIL_Image
+
+from torch.distributed import get_rank
+
+class ROSSegmentation():
+    def __init__(self):
+        rospy.loginfo("Initialise")  
+        #define Publisher      
+        self.seg_pub = rospy.Publisher("segmentation/color/image_raw", Image, queue_size = 1)
+        #define subcriber
+        self.img_sub = rospy.Subscriber(topic_subscriber, Image, self.ros_img_inference, queue_size=1, buff_size=2**24)
+        rospy.loginfo(".....")
+        rospy.loginfo("Initialization Done. Running Inference .....")
+
+    def ros_img_inference(self, msg):
+        #rospy.loginfo("get image inference")
+        img_arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, -1)
+        #inference of model unet
+        Unet_Infer=UNETInference(cfg_file,img_arr,model_ckpt,device)
+        image_merge=Unet_Infer.img_infer()
+        # image for output msg
+        out_msg = Image()
+        out_msg.header, out_msg.encoding  = msg.header, "rgb8"
+        out_msg.height, out_msg.width = image_merge.shape[0], image_merge.shape[1]
+        out_msg.step, out_msg.data = image_merge.shape[1]*3, image_merge.tostring()
+        #publish segmanted image
+        self.seg_pub.publish(out_msg)
+        return 
+
+if __name__ == '__main__':
+    
+    # initialyse node
+    rospy.init_node("unet_test", anonymous=True)
+
+    # get parametre from launch file
+    device = rospy.get_param("~device")
+    model_ckpt = rospy.get_param("~model_ckpt_path")
+    cfg_file = rospy.get_param("~cfg_file_path")
+    topic_subscriber=rospy.get_param("~topic_subscriber")
+
+    try:
+        # call class ROSSegmentation
+        seg_obj = ROSSegmentation()
+        # simply keeps your node from exiting until the node has been shutdown
+        rospy.spin()
+    except KeyboardInterrupt:
+        print("Shutting Down Node!!!")
+        sys.exit(0)

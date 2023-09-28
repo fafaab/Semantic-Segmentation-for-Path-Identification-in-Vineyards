@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+# System libs
+import os
+import sys
+from distutils.version import LooseVersion
+# Numerical libs
+import torch
+from torchvision import transforms as T
+import argparse 
+from torch.distributed import get_rank
+import cv2
+import numpy as np
+import time
+import timeit
+from config import load_cfg_from_cfg_file
+from unet_inference import UNETInference 
+# ROS libs
+from sensor_msgs.msg import CameraInfo
+from cv_bridge import CvBridge, CvBridgeError
+import rospy
+from sensor_msgs.msg import Image 
+#from sensor_msgs.msg import Image, CompressedImage
+#from PIL import Image as PIL_Image
+import pyrealsense2 as rs2
+if (not hasattr(rs2, 'intrinsics')):
+    import pyrealsense2.pyrealsense2 as rs2
+
+from torch.distributed import get_rank
+
+class ROSSegmentation():
+    def __init__(self):
+        rospy.loginfo("Initialise")  
+        self.sub_depth_image=rospy.Subscriber( depth_image_topic, Image, self.imageDepthCallback,queue_size=1)
+        self.sub_info=rospy.Subscriber(depth_info_topic , CameraInfo, self.imageDepthInfoCallback,queue_size=1)
+        
+        #define subcriber
+        self.sub_seg=rospy.Subscriber(topic_subscriber, Image,self.ros_img_inference, queue_size=1, buff_size=2**24)
+        rospy.loginfo(".....")
+        rospy.loginfo("Initialization Done. Running Inference .....")
+        #-----------------------------
+        self.bridge = CvBridge()
+        self.intrinsics = None
+        self.pix = None
+        self.pix_grade = None
+         #define Publisher      
+        self.seg_pub=rospy.Publisher("segmentation/color/image_raw", Image, queue_size = 1)
+        self.con_pub=rospy.Publisher("contour/color/image_raw", Image, queue_size = 1)
+        self.contour=None
+        self.tableau=None
+    #--------------
+    def imageDepthCallback(self, msg):
+        #print("trait image")
+        try:
+            cv_image = self.bridge.imgmsg_to_cv2(msg, msg.encoding)
+            #print("image shape",cv_image.shape)
+            # pick one pixel among all the pixels with the closest range:
+            #indices = np.array(np.where(cv_image == cv_image[cv_image > 0].min()))[:,0]
+            #pix = (indices[1], indices[0])
+            contours=self.get_contour(self.image_merge)
+            points=contours.shape
+            Num_point=points[0]
+            #print("points",Num_point)
+            #pix=(contours[0][0][1],contours[0][0][0])
+            #print("pix",pix)
+            #------------------loop all x,y of contours matrices
+            #print("--------------------all points from contours:")
+            for i in range(Num_point):
+                pix=(contours[i][0][0],contours[i][0][1])
+                self.pix = pix
+                #print("point with pixel",pix)
+                line = '\rDepth at pixel(%3d, %3d): %7.1f(mm).' % (pix[0],pix[1], cv_image[pix[1], pix[0]])
+                if self.intrinsics:
+                    depth = cv_image[pix[1], pix[0]]
+                    result = rs2.rs2_deproject_pixel_to_point(self.intrinsics, [pix[0], pix[1]], depth)
+                    #print('Coordinate: %8.2f %8.2f %8.2f.' % (result[0], result[1], result[2]))
+                    line += 'Coordinate: %8.2f %8.2f %8.2f.' % (result[0], result[1], result[2])
+                    #self.tableau=self.tableau+result
+                if (not self.pix_grade is None):
+                    print("not")
+                    line += ' Grade: %2d' % self.pix_grade 
+                line += '\r'   
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            
+
+            #----------------------test one cordonate
+            """pix=(contours[0][0][0],contours[0][0][1])
+            self.pix = pix
+            print("pix",pix)
+            print(cv_image[pix[1], pix[0]],cv_image[pix[0], pix[1]])
+            line = '\rDepth at pixel(%3d, %3d): %7.1f(mm).' % (pix[0],pix[1], cv_image[pix[1], pix[0]])
+            if self.intrinsics:
+                depth = cv_image[pix[1], pix[0]]
+                result = rs2.rs2_deproject_pixel_to_point(self.intrinsics, [pix[0], pix[1]], depth)
+                #print("coooordoonateeeeee",result)
+                line += '  Coordinate: %8.2f %8.2f %8.2f.' % (result[0], result[1], result[2])
+            if (not self.pix_grade is None):
+                print("not")
+                line += ' Grade: %2d' % self.pix_grade 
+            line += '\r'
+            sys.stdout.write(line)
+            sys.stdout.flush()"""
+            
+        except CvBridgeError as e:
+            print(e)
+            return
+        except ValueError as e:
+            return
+        
+
+    def imageDepthInfoCallback(self, cameraInfo):
+        try:
+            if self.intrinsics:
+                return
+            self.intrinsics = rs2.intrinsics()
+            self.intrinsics.width = cameraInfo.width
+            self.intrinsics.height = cameraInfo.height
+            self.intrinsics.ppx = cameraInfo.K[2]
+            self.intrinsics.ppy = cameraInfo.K[5]
+            self.intrinsics.fx = cameraInfo.K[0]
+            self.intrinsics.fy = cameraInfo.K[4]
+            if cameraInfo.distortion_model == 'plumb_bob':
+                self.intrinsics.model = rs2.distortion.brown_conrady
+            elif cameraInfo.distortion_model == 'equidistant':
+                self.intrinsics.model = rs2.distortion.kannala_brandt4
+            self.intrinsics.coeffs = [i for i in cameraInfo.D]
+        except CvBridgeError as e:
+            print(error)
+            return
+    #-------------------------------
+    def get_contour(self,image):
+        # Convert image to gray and blur it
+        src_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        src_gray = cv2.blur(src_gray, (9,9))
+        contours, hierarchy = cv2.findContours(src_gray, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        drawing = np.zeros((src_gray .shape[0], src_gray .shape[1], 3), dtype=np.uint8)
+        vecteur_contour=np.array(contours).squeeze(0)
+        """if len(contours) >1:
+            print(len(contours[0]))
+            contours=contours[0]"""
+        #print("contours",len(contours))
+        for i in range(len(contours)):
+            color =  255,0,0
+            cv2.drawContours(drawing, contours, i, color, 2, cv2.LINE_8, hierarchy, 0)
+        out_msg = Image()
+        out_msg.header, out_msg.encoding  = self.msg_seg, "rgb8"
+        out_msg.height, out_msg.width = drawing.shape[0], drawing.shape[1]
+        out_msg.step, out_msg.data = drawing.shape[1]*3,drawing.tostring()
+        self.con_pub.publish(out_msg)
+        
+        return vecteur_contour
+
+    def ros_img_inference(self, msg):
+        
+        #rospy.loginfo("get image inference")
+        img_arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, -1)
+        #inference of model unet
+        Unet_Infer=UNETInference(cfg_file,img_arr,model_ckpt,device)
+        self.image_merge=Unet_Infer.img_infer()
+        #print("contour shape",contour.shape)
+        # image for output msg
+        out_msg = Image()
+        self.msg_seg=msg.header
+        out_msg.header, out_msg.encoding  = msg.header, "rgb8"
+        out_msg.height, out_msg.width = self.image_merge.shape[0], self.image_merge.shape[1]
+        out_msg.step, out_msg.data = self.image_merge.shape[1]*3, self.image_merge.tostring()
+        #publish segmanted image
+        self.seg_pub.publish(out_msg)
+        return 
+
+if __name__ == '__main__':
+    
+    # initialyse node
+    rospy.init_node("unet_test", anonymous=True)
+
+    # get parametre from launch file
+    device = rospy.get_param("~device")
+    model_ckpt = rospy.get_param("~model_ckpt_path")
+    cfg_file = rospy.get_param("~cfg_file_path")
+    topic_subscriber=rospy.get_param("~topic_subscriber")
+    #---------------
+    depth_image_topic = '/d400/aligned_depth_to_color/image_raw'#'/camera/depth/image_rect_raw'#'
+    depth_info_topic = '/d400/aligned_depth_to_color/camera_info' #'/camera/depth/camera_info'#
+    #------------
+    try:
+      
+        seg_obj = ROSSegmentation()
+        
+        # simply keeps your node from exiting until the node has been shutdown
+        rospy.spin()
+    except KeyboardInterrupt:
+        print("Shutting Down Node!!!")
+        sys.exit(0)

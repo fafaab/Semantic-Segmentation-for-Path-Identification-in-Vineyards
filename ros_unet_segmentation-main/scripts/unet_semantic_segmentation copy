@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+# System libs
+import os
+import sys
+from distutils.version import LooseVersion
+# Numerical libs
+import torch
+from torchvision import transforms as T
+import argparse 
+from torch.distributed import get_rank
+import cv2
+import numpy as np
+import time
+import timeit
+from config import load_cfg_from_cfg_file
+# ROS libs
+import rospy
+from sensor_msgs.msg import Image, CompressedImage
+#from PIL import Image as PIL_Image
+
+from torch.distributed import get_rank
+
+class ROSSegmentation():
+    def __init__(self,cfg):
+        self.cfg = cfg
+
+        rospy.loginfo("Initialise")  
+        #define Publisher      
+        self.seg_pub = rospy.Publisher("segmentation/color/image_raw", Image, queue_size = 1)
+        #define subcriber
+        self.img_sub = rospy.Subscriber(topic_subscriber, Image, self.img_infer, queue_size=1, buff_size=2**24)
+        rospy.loginfo(".....")
+        rospy.loginfo("Initialization Done. Running Inference .....")
+
+    def color_class(self,preds):
+    # fonction pour afficher que la route
+        #print("--vigne_color")
+        preds[preds==1]=255 # mettre classe route vigne = 255
+        preds[preds!=255]=0 # mettre le reste des classes = 0
+        return preds
+
+    def resize(self,img):
+        H_RESIZE=318
+        # resize the image and masks
+        img = cv2.resize(img, dsize=(cfg.TEST_W, H_RESIZE))
+        return img
+    def add_pad(self,img):
+        global pad_h,pad_h_half,pad_w, pad_w_half, ori_h,ori_w
+        #print(mask.shape, img.shape)
+        ori_h, ori_w, _ = img.shape
+        pad_h = max(cfg.TEST_H - ori_h, 0)
+        pad_w = max(cfg.TEST_W - ori_w, 0)
+        pad_h_half = int(pad_h / 2)
+        pad_w_half = int(pad_w / 2)
+        if pad_h > 0 or pad_w > 0:
+            img = cv2.copyMakeBorder(img, pad_h_half, pad_h - pad_h_half,pad_w_half, pad_w - pad_w_half, cv2.BORDER_CONSTANT, value=0)
+        return img
+
+    def load_model(self,model_ckpt, device):
+    # fonction for loading the pretrained_model
+        # load the modele in the device
+        model = torch.load(model_ckpt,map_location=device)
+        model.eval()
+        return model
+
+    def pre_process(self,img, device):
+        #resize image
+        img=self.resize(img)
+        img=self.add_pad(img) # with padding
+        # normalisation and standardization
+        t = T.Compose([T.ToTensor(), T.Normalize(cfg.MEAN, cfg.STD)])
+        img=t(img)
+        # image to device
+        img=img.to(device)
+        img = img.unsqueeze(0)
+        return img
+
+    def inference(self,model,img):
+        # fonction for prediction
+        with torch.no_grad():
+            prediction = model(img)
+        return prediction
+
+    def post_process(self,prediction,image_ori,msg):
+        # fonction to treat image after inference
+        pred_mask = torch.argmax(prediction, dim=1)
+        pred_mask = pred_mask.detach().cpu().numpy().copy()
+        # ----------choose the color of class  and the 3 channel image
+        pred =pred_mask.astype(np.uint8).transpose((1, 2, 0))
+        #crop pred
+        pred = pred[pad_h_half:pad_h_half+ori_h, pad_w_half:pad_w_half+ori_w]
+        pred = cv2.resize(pred, (image_ori.shape[1], image_ori.shape[0]), interpolation=cv2.INTER_LINEAR)
+        pred=self.color_class(pred)
+        # takes single channel images and combines them to make a multi-channel image: get tree chanel (355, 473, 3)
+        pred = cv2.merge([pred, pred, pred]) 
+        # add prediction and image 
+        #print("pred",pred.shape, type(pred))
+        #print("pred",image_ori.shape, type (image_ori))
+        image_merge = cv2.addWeighted(image_ori, 0.5, pred, 0.8, 0)
+        # image for output msg
+        out_msg = Image()
+        out_msg.header, out_msg.encoding  = msg.header, "rgb8"
+        out_msg.height, out_msg.width = image_merge.shape[0], image_merge.shape[1]
+        out_msg.step, out_msg.data = image_merge.shape[1]*3, image_merge.tostring()
+        #publish segmanted image
+        self.seg_pub.publish(out_msg)
+        return 
+
+    def img_infer(self, msg):
+        #rospy.loginfo("get image inference")
+        img_arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, -1)
+        #print(".....",img_arr.shape)
+        input=self.pre_process(img_arr, device)
+        output=self.inference(model,input)
+        self.post_process(output,img_arr,msg)
+        return 
+
+if __name__ == '__main__':
+    
+    # initialyse node
+    rospy.init_node("unet_test", anonymous=True)
+
+    # get parametre from launch file
+    device = rospy.get_param("~device")
+    model_ckpt = rospy.get_param("~model_ckpt_path")
+    cfg_file = rospy.get_param("~cfg_file_path")
+    topic_subscriber=rospy.get_param("~topic_subscriber")
+    #load config file yaml:
+    cfg=load_cfg_from_cfg_file(cfg_file)
+
+    #load model
+    model = torch.load(model_ckpt,map_location=device)
+    model.eval()
+
+    try:
+        # call class ROSSegmentation
+        seg_obj = ROSSegmentation(cfg)
+        # simply keeps your node from exiting until the node has been shutdown
+        rospy.spin()
+    except KeyboardInterrupt:
+        print("Shutting Down Node!!!")
+        sys.exit(0)
